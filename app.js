@@ -384,6 +384,9 @@
   }
 
   // --- SoundCloud Widget Integration ---
+  let hasPlayedOnce = false;
+  let audioStartedTimestamp = 0;
+
   function initSoundCloudPlayer() {
     const iframe = document.getElementById("sc-widget-iframe");
     const encodedUrl = encodeURIComponent(currentSong.url);
@@ -410,9 +413,39 @@
       });
     });
 
+    // Listen to real audio progress from SoundCloud so buffering time never eats into the 1s snippet
+    scWidget.bind(window.SC.Widget.Events.PLAY_PROGRESS, (data) => {
+      if (!isPlaying) return;
+      const posMs = data && typeof data.currentPosition === "number" ? data.currentPosition : 0;
+      if (posMs > 0) {
+        hasPlayedOnce = true;
+        if (!audioStartedTimestamp) {
+          audioStartedTimestamp = performance.now() - posMs;
+        }
+        handleAudioPositionUpdate(posMs);
+      }
+    });
+
     scWidget.bind(window.SC.Widget.Events.ERROR, () => {
       elPlayerStatus.textContent = "Audio stream unavailable — try refreshing";
     });
+  }
+
+  function handleAudioPositionUpdate(posMs) {
+    if (!isPlaying) return;
+    const durationSec = getCurrentUnlockedSeconds();
+    const durationMs = durationSec * 1000;
+    const totalMaxSec = CONFIG.segments[CONFIG.segments.length - 1];
+
+    const clampedSec = Math.min(posMs / 1000, durationSec);
+    const fillPct = (clampedSec / totalMaxSec) * 100;
+    elTimelineFill.style.width = `${fillPct}%`;
+    elTimeElapsed.textContent = formatSeconds(clampedSec);
+    elPlayerStatus.textContent = `Playing ${durationSec}s snippet...`;
+
+    if (posMs >= durationMs) {
+      stopSnippetPlayback(true);
+    }
   }
 
   function updatePlayButtonIcon(state) {
@@ -440,47 +473,71 @@
 
     clearPlaybackTimers();
     const durationSec = getCurrentUnlockedSeconds();
-    const totalMaxSec = CONFIG.segments[CONFIG.segments.length - 1];
+    const durationMs = durationSec * 1000;
 
     isPlaying = true;
+    audioStartedTimestamp = 0;
+    elTimelineFill.style.width = "0%";
+    elTimeElapsed.textContent = "0:00";
     updatePlayButtonIcon("pause");
-    elPlayerStatus.textContent = `Playing ${durationSec}s snippet...`;
+    elPlayerStatus.textContent = hasPlayedOnce
+      ? `Playing ${durationSec}s snippet...`
+      : `Starting ${durationSec}s snippet...`;
 
-    scWidget.seekTo(0);
+    // On first play, the widget is already at 0ms. Calling seekTo(0) before play()
+    // when the stream hasn't buffered yet can drop the initial play command.
+    if (hasPlayedOnce) {
+      scWidget.seekTo(0);
+    }
     scWidget.play();
 
-    playStartTimestamp = performance.now();
-
+    // Poll getPosition() alongside PLAY_PROGRESS for smooth 60fps UI updates and exact cutoff
     progressIntervalId = setInterval(() => {
-      const elapsedSec = (performance.now() - playStartTimestamp) / 1000;
-      const clampedSec = Math.min(elapsedSec, durationSec);
-      const fillPct = (clampedSec / totalMaxSec) * 100;
-      elTimelineFill.style.width = `${fillPct}%`;
-      elTimeElapsed.textContent = formatSeconds(clampedSec);
+      if (!isPlaying) return;
 
-      if (elapsedSec >= durationSec) {
+      scWidget.getPosition((posMs) => {
+        if (!isPlaying) return;
+        if (typeof posMs === "number" && posMs > 0) {
+          hasPlayedOnce = true;
+          if (!audioStartedTimestamp) {
+            audioStartedTimestamp = performance.now() - posMs;
+          }
+          handleAudioPositionUpdate(posMs);
+        } else if (audioStartedTimestamp > 0) {
+          // Smooth interpolation once audio has confirmed starting
+          const elapsedMs = performance.now() - audioStartedTimestamp;
+          handleAudioPositionUpdate(elapsedMs);
+        }
+      });
+    }, 40);
+
+    // Safety fallback timeout (allows up to 4s for initial stream buffer if needed)
+    stopTimeoutId = setTimeout(() => {
+      if (isPlaying) {
         stopSnippetPlayback(true);
       }
-    }, 50);
-
-    stopTimeoutId = setTimeout(() => {
-      stopSnippetPlayback(true);
-    }, durationSec * 1000 + 80);
+    }, durationMs + 4000);
   }
 
   function stopSnippetPlayback(completedNaturally = false) {
     clearPlaybackTimers();
+    isPlaying = false;
+    audioStartedTimestamp = 0;
+
     if (scWidget && isWidgetReady) {
       scWidget.pause();
       scWidget.seekTo(0);
     }
-    isPlaying = false;
     updatePlayButtonIcon("play");
 
     if (!completedNaturally) {
       elTimelineFill.style.width = "0%";
       elTimeElapsed.textContent = "0:00";
     } else {
+      const durationSec = getCurrentUnlockedSeconds();
+      const totalMaxSec = CONFIG.segments[CONFIG.segments.length - 1];
+      elTimelineFill.style.width = `${(durationSec / totalMaxSec) * 100}%`;
+      elTimeElapsed.textContent = formatSeconds(durationSec);
       setTimeout(() => {
         if (!isPlaying) {
           elTimelineFill.style.width = "0%";
