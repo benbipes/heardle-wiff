@@ -725,16 +725,17 @@ html, body {
   width: 100%;
 }
 
-/* Hidden SoundCloud Widget */
+/* Hidden SoundCloud Widget (kept inside viewport so iOS Safari/Chrome allow audio) */
 .sc-widget-hidden {
   position: fixed;
-  left: -9999px;
-  top: -9999px;
-  width: 200px;
-  height: 200px;
-  opacity: 0.001;
+  left: 0;
+  bottom: 0;
+  width: 1px;
+  height: 1px;
+  opacity: 0.01;
   pointer-events: none;
   overflow: hidden;
+  z-index: -1;
 }
 
 /* Modals */

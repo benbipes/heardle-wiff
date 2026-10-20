@@ -383,52 +383,166 @@
     }
   }
 
-  // --- SoundCloud Widget Integration ---
+  // --- Dual-Engine Audio Integration (SoundCloud Widget + Native HTML5 Audio Fallback) ---
+  // Why Dual-Engine?
+  // 1. iOS Safari and mobile Chrome frequently block programmatic play() inside cross-origin
+  //    SoundCloud iframes because the tap gesture occurred in the parent window.
+  // 2. Some SoundCloud major-label tracks are geo-restricted (30-sec preview or blocked in certain regions),
+  //    or blocked by browser privacy/ad-blocker extensions.
+  // By preloading a native HTML5 <audio> backup stream alongside the SoundCloud Widget, we can:
+  // - Unlock native iOS/Android audio synchronously inside the user's tap gesture
+  // - Seamlessly play via SoundCloud when available, or auto-failover to native HTML5 audio within 900ms
+  //   if the SoundCloud iframe is blocked or silent on a user's device.
   let hasPlayedOnce = false;
   let audioStartedTimestamp = 0;
+  let nativeAudio = new Audio();
+  nativeAudio.preload = "auto";
+  nativeAudio.crossOrigin = "anonymous";
+  let nativeAudioReady = false;
+  let useNativeFallback = false;
+  let scFailoverTimerId = null;
 
   function initSoundCloudPlayer() {
+    // 1. Fetch native HTML5 audio backup stream & artwork in parallel
+    preloadNativeAudioBackup();
+
+    // 2. Initialize SoundCloud Widget iframe
     const iframe = document.getElementById("sc-widget-iframe");
     const encodedUrl = encodeURIComponent(currentSong.url);
     iframe.src = `https://w.soundcloud.com/player/?url=${encodedUrl}&auto_play=false&hide_related=true&show_comments=false&show_user=false&show_reposts=false&show_teaser=false`;
 
-    scWidget = window.SC.Widget(iframe);
+    if (window.SC && window.SC.Widget) {
+      scWidget = window.SC.Widget(iframe);
 
-    scWidget.bind(window.SC.Widget.Events.READY, () => {
-      isWidgetReady = true;
-      elBtnPlay.disabled = false;
-      updatePlayButtonIcon("play");
-      renderTimelineAndControls();
+      scWidget.bind(window.SC.Widget.Events.READY, () => {
+        isWidgetReady = true;
+        markPlayerReady();
 
-      // Fetch artwork from SoundCloud metadata if available
-      scWidget.getCurrentSound((sound) => {
-        if (sound && sound.artwork_url) {
-          trackArtworkUrl = sound.artwork_url.replace("-large", "-t300x300");
-          if (gameState.status !== "IN_PROGRESS") {
-            elResultArtwork.src = trackArtworkUrl;
-            elResultArtwork.classList.remove("hidden");
-            elResultArtworkFallback.classList.add("hidden");
+        // Fetch artwork from SoundCloud metadata if available
+        scWidget.getCurrentSound((sound) => {
+          if (sound && sound.artwork_url) {
+            trackArtworkUrl = sound.artwork_url.replace("-large", "-t300x300");
+            updateResultArtwork();
           }
+        });
+      });
+
+      // If SoundCloud starts late after we've already switched to the backup stream, silence it
+      scWidget.bind(window.SC.Widget.Events.PLAY, () => {
+        if (useNativeFallback || !isPlaying) {
+          try {
+            scWidget.pause();
+          } catch (e) {}
         }
       });
-    });
 
-    // Listen to real audio progress from SoundCloud so buffering time never eats into the 1s snippet
-    scWidget.bind(window.SC.Widget.Events.PLAY_PROGRESS, (data) => {
-      if (!isPlaying) return;
-      const posMs = data && typeof data.currentPosition === "number" ? data.currentPosition : 0;
-      if (posMs > 0) {
-        hasPlayedOnce = true;
-        if (!audioStartedTimestamp) {
-          audioStartedTimestamp = performance.now() - posMs;
+      // Listen to real audio progress from SoundCloud
+      scWidget.bind(window.SC.Widget.Events.PLAY_PROGRESS, (data) => {
+        if (!isPlaying || useNativeFallback) return;
+        const posMs = data && typeof data.currentPosition === "number" ? data.currentPosition : 0;
+        if (posMs > 0) {
+          if (scFailoverTimerId) {
+            clearTimeout(scFailoverTimerId);
+            scFailoverTimerId = null;
+          }
+          hasPlayedOnce = true;
+          if (!audioStartedTimestamp) {
+            audioStartedTimestamp = performance.now() - posMs;
+          }
+          handleAudioPositionUpdate(posMs);
         }
-        handleAudioPositionUpdate(posMs);
-      }
-    });
+      });
 
-    scWidget.bind(window.SC.Widget.Events.ERROR, () => {
-      elPlayerStatus.textContent = "Audio stream unavailable — try refreshing";
-    });
+      scWidget.bind(window.SC.Widget.Events.ERROR, () => {
+        // SoundCloud blocked or track restricted -> switch to native HTML5 audio engine
+        if (nativeAudioReady) {
+          useNativeFallback = true;
+          markPlayerReady();
+          if (isPlaying) {
+            startNativeAudioPlayback();
+          }
+        } else {
+          elPlayerStatus.textContent = "Loading backup audio stream...";
+        }
+      });
+    } else {
+      // SoundCloud API script blocked by ad-blocker
+      useNativeFallback = true;
+    }
+
+    // If neither engine loads, tell the user why rather than spinning forever
+    setTimeout(() => {
+      if (!isWidgetReady && !nativeAudioReady) {
+        elPlayerStatus.textContent = "Audio couldn't load — disable content blockers or refresh";
+      }
+    }, 8000);
+  }
+
+  function preloadNativeAudioBackup() {
+    const query = encodeURIComponent(`${currentSong.artist} ${currentSong.title}`);
+    // Strip "(feat. ...)", "(Remaster)" etc. before comparing titles
+    const coreTitle = (s) => normalizeText((s || "").replace(/\(.*?\)|\[.*?\]/g, ""));
+    fetch(`https://itunes.apple.com/search?term=${query}&entity=song&limit=10`)
+      .then((res) => res.json())
+      .then((data) => {
+        if (!data || !data.results || data.results.length === 0) return;
+        // Require BOTH artist and exact core title to match — never play a different song as the backup.
+        // Prefer the original recording over acoustic/live/demo/remix/instrumental versions.
+        const wantArtist = normalizeText(currentSong.artist);
+        const wantTitle = coreTitle(currentSong.title);
+        const altVersion = /\b(acoustic|live|demo|remix|instrumental|karaoke|unplugged|re-?recorded|cover)\b/i;
+        const candidates = data.results.filter((r) => {
+          const ra = normalizeText(r.artistName);
+          const artistOk = ra.includes(wantArtist) || wantArtist.includes(ra);
+          return r.previewUrl && artistOk && coreTitle(r.trackName) === wantTitle;
+        });
+        const match =
+          candidates.find((r) => !altVersion.test(r.trackName) && !altVersion.test(r.collectionName || "")) ||
+          candidates.find((r) => !altVersion.test(r.trackName)) ||
+          candidates[0];
+
+        if (match && match.previewUrl) {
+          nativeAudio.src = match.previewUrl;
+          nativeAudio.load();
+          nativeAudioReady = true;
+
+          if (!trackArtworkUrl && match.artworkUrl100) {
+            trackArtworkUrl = match.artworkUrl100.replace("100x100bb", "300x300bb");
+            updateResultArtwork();
+          }
+
+          // Prefer native audio automatically on iOS/iPadOS where cross-origin iframe play() is blocked
+          const isIOS =
+            /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+            (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+          if (isIOS) {
+            useNativeFallback = true;
+          }
+
+          markPlayerReady();
+        }
+      })
+      .catch((err) => {
+        console.warn("Backup stream lookup failed:", err);
+      });
+  }
+
+  function markPlayerReady() {
+    if (isWidgetReady || nativeAudioReady) {
+      elBtnPlay.disabled = false;
+      if (!isPlaying) {
+        updatePlayButtonIcon("play");
+      }
+      renderTimelineAndControls();
+    }
+  }
+
+  function updateResultArtwork() {
+    if (trackArtworkUrl && gameState.status !== "IN_PROGRESS") {
+      elResultArtwork.src = trackArtworkUrl;
+      elResultArtwork.classList.remove("hidden");
+      elResultArtworkFallback.classList.add("hidden");
+    }
   }
 
   function handleAudioPositionUpdate(posMs) {
@@ -459,7 +573,7 @@
   }
 
   function togglePlayback() {
-    if (!isWidgetReady || !scWidget) return;
+    if (!isWidgetReady && !nativeAudioReady) return;
 
     if (isPlaying) {
       stopSnippetPlayback();
@@ -469,8 +583,6 @@
   }
 
   function startSnippetPlayback() {
-    if (!scWidget || !isWidgetReady) return;
-
     clearPlaybackTimers();
     const durationSec = getCurrentUnlockedSeconds();
     const durationMs = durationSec * 1000;
@@ -484,39 +596,111 @@
       ? `Playing ${durationSec}s snippet...`
       : `Starting ${durationSec}s snippet...`;
 
-    // On first play, the widget is already at 0ms. Calling seekTo(0) before play()
-    // when the stream hasn't buffered yet can drop the initial play command.
-    if (hasPlayedOnce) {
-      scWidget.seekTo(0);
+    // If using native HTML5 audio (iOS or fallback activated), play directly in user gesture
+    if (useNativeFallback && nativeAudioReady) {
+      startNativeAudioPlayback();
+      return;
     }
-    scWidget.play();
 
-    // Poll getPosition() alongside PLAY_PROGRESS for smooth 60fps UI updates and exact cutoff
-    progressIntervalId = setInterval(() => {
-      if (!isPlaying) return;
-
-      scWidget.getPosition((posMs) => {
-        if (!isPlaying) return;
-        if (typeof posMs === "number" && posMs > 0) {
-          hasPlayedOnce = true;
-          if (!audioStartedTimestamp) {
-            audioStartedTimestamp = performance.now() - posMs;
-          }
-          handleAudioPositionUpdate(posMs);
-        } else if (audioStartedTimestamp > 0) {
-          // Smooth interpolation once audio has confirmed starting
-          const elapsedMs = performance.now() - audioStartedTimestamp;
-          handleAudioPositionUpdate(elapsedMs);
+    // Unlock nativeAudio on user tap gesture (muted briefly) in case SoundCloud fails 900ms later
+    if (nativeAudioReady && !hasPlayedOnce) {
+      nativeAudio.muted = true;
+      nativeAudio.play().then(() => {
+        if (!useNativeFallback) {
+          nativeAudio.pause();
+          nativeAudio.currentTime = 0;
         }
+        nativeAudio.muted = false;
+      }).catch(() => {
+        nativeAudio.muted = false;
       });
-    }, 40);
+    }
 
-    // Safety fallback timeout (allows up to 4s for initial stream buffer if needed)
+    if (scWidget && isWidgetReady) {
+      if (hasPlayedOnce) {
+        scWidget.seekTo(0);
+      }
+      scWidget.play();
+
+      // If SoundCloud hasn't produced >0ms audio within 950ms (e.g., mobile autoplay block or geo-restriction),
+      // seamlessly switch to native HTML5 audio so the user hears music immediately.
+      if (nativeAudioReady) {
+        scFailoverTimerId = setTimeout(() => {
+          if (isPlaying && !audioStartedTimestamp) {
+            useNativeFallback = true;
+            try {
+              scWidget.pause();
+            } catch (e) {}
+            startNativeAudioPlayback();
+          }
+        }, 950);
+      }
+
+      progressIntervalId = setInterval(() => {
+        if (!isPlaying || useNativeFallback) return;
+
+        scWidget.getPosition((posMs) => {
+          if (!isPlaying || useNativeFallback) return;
+          if (typeof posMs === "number" && posMs > 0) {
+            if (scFailoverTimerId) {
+              clearTimeout(scFailoverTimerId);
+              scFailoverTimerId = null;
+            }
+            hasPlayedOnce = true;
+            if (!audioStartedTimestamp) {
+              audioStartedTimestamp = performance.now() - posMs;
+            }
+            handleAudioPositionUpdate(posMs);
+          } else if (audioStartedTimestamp > 0) {
+            const elapsedMs = performance.now() - audioStartedTimestamp;
+            handleAudioPositionUpdate(elapsedMs);
+          }
+        });
+      }, 40);
+    } else if (nativeAudioReady) {
+      useNativeFallback = true;
+      startNativeAudioPlayback();
+      return;
+    }
+
+    // Safety fallback timeout
     stopTimeoutId = setTimeout(() => {
       if (isPlaying) {
         stopSnippetPlayback(true);
       }
-    }, durationMs + 4000);
+    }, durationMs + 4500);
+  }
+
+  function startNativeAudioPlayback() {
+    clearPlaybackTimers();
+    const durationSec = getCurrentUnlockedSeconds();
+    const durationMs = durationSec * 1000;
+
+    nativeAudio.muted = false;
+    nativeAudio.currentTime = 0;
+    const playPromise = nativeAudio.play();
+    if (playPromise && typeof playPromise.catch === "function") {
+      playPromise.catch((err) => {
+        console.warn("Native audio play error:", err);
+        elPlayerStatus.textContent = "Tap Play again to start audio";
+        stopSnippetPlayback(false);
+      });
+    }
+
+    progressIntervalId = setInterval(() => {
+      if (!isPlaying) return;
+      const posMs = nativeAudio.currentTime * 1000;
+      if (posMs > 0) {
+        hasPlayedOnce = true;
+        handleAudioPositionUpdate(posMs);
+      }
+    }, 35);
+
+    stopTimeoutId = setTimeout(() => {
+      if (isPlaying) {
+        stopSnippetPlayback(true);
+      }
+    }, durationMs + 2500);
   }
 
   function stopSnippetPlayback(completedNaturally = false) {
@@ -525,9 +709,19 @@
     audioStartedTimestamp = 0;
 
     if (scWidget && isWidgetReady) {
-      scWidget.pause();
-      scWidget.seekTo(0);
+      try {
+        scWidget.pause();
+        scWidget.seekTo(0);
+      } catch (e) {}
     }
+
+    if (nativeAudioReady) {
+      try {
+        nativeAudio.pause();
+        nativeAudio.currentTime = 0;
+      } catch (e) {}
+    }
+
     updatePlayButtonIcon("play");
 
     if (!completedNaturally) {
@@ -549,6 +743,10 @@
   }
 
   function clearPlaybackTimers() {
+    if (scFailoverTimerId) {
+      clearTimeout(scFailoverTimerId);
+      scFailoverTimerId = null;
+    }
     if (stopTimeoutId) {
       clearTimeout(stopTimeoutId);
       stopTimeoutId = null;
