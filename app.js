@@ -387,8 +387,12 @@
   let hasPlayedOnce = false;
   let audioStartedTimestamp = 0;
   let noAudioTimerId = null;
+  let playRetryIntervalId = null;
+  // Re-send play() every 600ms (up to 10 times) while SoundCloud is still loading the stream
+  const PLAY_RETRY_INTERVAL_MS = 600;
+  const PLAY_RETRY_MAX = 10;
   // How long to wait for SoundCloud to report real audio before telling the user to retry
-  const NO_AUDIO_TIMEOUT_MS = 4000;
+  const NO_AUDIO_TIMEOUT_MS = 7000;
 
   function initSoundCloudPlayer() {
     const iframe = document.getElementById("sc-widget-iframe");
@@ -450,6 +454,10 @@
     if (noAudioTimerId) {
       clearTimeout(noAudioTimerId);
       noAudioTimerId = null;
+    }
+    if (playRetryIntervalId) {
+      clearInterval(playRetryIntervalId);
+      playRetryIntervalId = null;
     }
     hasPlayedOnce = true;
     if (!audioStartedTimestamp) {
@@ -524,7 +532,25 @@
     }
     scWidget.play();
 
-    // If SoundCloud never produces audio (e.g. the browser blocked playback), stop and ask for a retry
+    // SoundCloud often drops the very first play() while it is still loading the stream,
+    // which is why a second tap works instantly. Re-send play() automatically until audio starts.
+    let retries = 0;
+    playRetryIntervalId = setInterval(() => {
+      if (!isPlaying || audioStartedTimestamp) {
+        clearInterval(playRetryIntervalId);
+        playRetryIntervalId = null;
+        return;
+      }
+      retries++;
+      if (retries > PLAY_RETRY_MAX) {
+        clearInterval(playRetryIntervalId);
+        playRetryIntervalId = null;
+        return;
+      }
+      scWidget.play();
+    }, PLAY_RETRY_INTERVAL_MS);
+
+    // If SoundCloud still never produces audio, stop and ask for a manual retry
     noAudioTimerId = setTimeout(() => {
       if (isPlaying && !audioStartedTimestamp) {
         stopSnippetPlayback(false);
@@ -585,6 +611,10 @@
     if (noAudioTimerId) {
       clearTimeout(noAudioTimerId);
       noAudioTimerId = null;
+    }
+    if (playRetryIntervalId) {
+      clearInterval(playRetryIntervalId);
+      playRetryIntervalId = null;
     }
     if (stopTimeoutId) {
       clearTimeout(stopTimeoutId);
